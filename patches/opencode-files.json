@@ -1,0 +1,37 @@
+[
+  {
+    "path": "packages/opencode/src/config/config.ts",
+    "before_sha256": "cd3d3a91fbb93aa04f9a712de8c238d5e8bc07a7be3db03e95f71634e34e1be0",
+    "after_sha256": "b444859dacdc7a224d7799e16d17f865eb802b200059f8495439d412dde50e7b"
+  },
+  {
+    "path": "packages/opencode/src/session/compaction-cancel.ts",
+    "before_sha256": null,
+    "after_sha256": "11c3f1dc1473965d0795009bed258e3cd1de888034455d8b6ed47d019d816126"
+  },
+  {
+    "path": "packages/opencode/src/session/compaction.ts",
+    "before_sha256": "44b33a91a18174aa8c8245131f595e2bd9ba1f64002f8ec5cf83f028d6e6eccc",
+    "after_sha256": "4017d27f001669a4fbabc7e0778f898b9eabc88ab8f447615179941389f495fd"
+  },
+  {
+    "path": "packages/opencode/src/session/message-v2.ts",
+    "before_sha256": "f30fb53acee650f4fdcc245e5bfbd5ad818bff7f624c85b5ccd304001b31dbe3",
+    "after_sha256": "91ef8c9f2deeb8a099ca4864369eea36ab553cf74788c907972adbcc8931191e"
+  },
+  {
+    "path": "packages/opencode/test/config/compaction.test.ts",
+    "before_sha256": null,
+    "after_sha256": "c07797c7ed332cb8db231d84a5c736ca608c92c8903585738789c2d485185fc7"
+  },
+  {
+    "path": "packages/opencode/test/session/compaction-cancel.test.ts",
+    "before_sha256": null,
+    "after_sha256": "4d7f52648e72d0fa0d4cef099db1fc771f4eca867f46a6617f3a0891d4f547dc"
+  },
+  {
+    "path": "packages/opencode/test/session/compaction.test.ts",
+    "before_sha256": "e8aad8ab9d769c45616b9ce1d8ec73d49c42aae15c9281d37240766f8ea667a1",
+    "after_sha256": "f74bc8554dea215a3773cf02c4726f0e160c9e7f9d27895fa6bb1332cf07025c"
+  }
+]

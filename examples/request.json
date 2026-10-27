@@ -1,0 +1,12 @@
+{
+  "request_id": "synthetic-demo-001",
+  "target_ratio_pct": 25,
+  "system_prompt": "You maintain a fictional Python parser. Preserve constraints and test results.",
+  "tool_defs": [{"name": "read_file", "description": "Read a project file", "args": [{"name": "path", "description": "Project-relative file path"}]}],
+  "messages": [
+    {"role": "user", "content": "Fix empty-input handling in src/parser.py. Keep the parse(text) signature unchanged."},
+    {"role": "assistant", "content": [{"type": "text", "text": "I will inspect the parser."}, {"type": "tool-call", "toolCallId": "call-1", "toolName": "read_file", "input": {"path": "src/parser.py"}}]},
+    {"role": "tool", "content": [{"type": "tool-result", "toolCallId": "call-1", "toolName": "read_file", "output": {"type": "text", "value": "def parse(text):\n    return text.splitlines()[0]\n\n# synthetic fixture only\n"}}]},
+    {"role": "assistant", "content": "The empty list causes IndexError. Next: add an empty-input guard and tests."}
+  ]
+}

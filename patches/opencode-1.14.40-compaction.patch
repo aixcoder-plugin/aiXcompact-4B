@@ -1,0 +1,1211 @@
+diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
+index fcdb4e7..0744e19 100644
+--- a/packages/opencode/src/config/config.ts
++++ b/packages/opencode/src/config/config.ts
+@@ -272,6 +272,25 @@
+       reserved: Schema.optional(NonNegativeInt).annotate({
+         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
+       }),
++      service_url: Schema.optional(Schema.String).annotate({
++        description:
++          "URL of an external compaction service. When set, compaction is delegated to this HTTP service instead of using the built-in LLM approach. Omit to use built-in compaction. Example: http://127.0.0.1:12003",
++      }),
++      service_timeout: Schema.optional(
++        Schema.Union([PositiveInt, Schema.Literal(false)]).annotate({
++          description:
++            "Timeout in milliseconds for external compaction service requests. On timeout, OpenCode also calls POST /cancel/{request_id}. Default is 1800000 (30 minutes). Set to false to disable timeout.",
++        }),
++      ).annotate({
++        description:
++          "Timeout in milliseconds for external compaction service requests. On timeout, OpenCode also calls POST /cancel/{request_id}. Default is 1800000 (30 minutes). Set to false to disable timeout.",
++      }),
++      target_ratio_pct: Schema.optional(
++        Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 99 })).annotate({
++          description:
++            "Target percentage of input tokens to retain after external compaction (default: 25). Values from 10 to 50 in multiples of 5 are recommended.",
++        }),
++      ),
+     }),
+   ),
+   experimental: Schema.optional(
+diff --git a/packages/opencode/src/session/compaction-cancel.ts b/packages/opencode/src/session/compaction-cancel.ts
+new file mode 100644
+index 0000000..a46a189
+--- /dev/null
++++ b/packages/opencode/src/session/compaction-cancel.ts
+@@ -0,0 +1,61 @@
++export const DEFAULT_COMPACTION_CANCEL_TIMEOUT = 5_000
++
++export type CompactionCancelTrigger = "interrupt" | "timeout"
++
++export type CompactionCancelResult = {
++  trigger: CompactionCancelTrigger
++  outcome: "cancelled" | "not_found" | "failed"
++  httpStatus?: number
++  detail?: string
++}
++
++type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
++
++export function createCompactionCanceller(input: {
++  cancelUrl: string
++  requestController: AbortController
++  fetchFn?: FetchLike
++  cancelTimeout?: number
++}) {
++  const fetchFn = input.fetchFn ?? fetch
++  const cancelTimeout = input.cancelTimeout ?? DEFAULT_COMPACTION_CANCEL_TIMEOUT
++  let pending: Promise<CompactionCancelResult> | undefined
++
++  const notifyService = async (trigger: CompactionCancelTrigger): Promise<CompactionCancelResult> => {
++    const cancelController = new AbortController()
++    const timer = setTimeout(
++      () => cancelController.abort(new DOMException(`cancel timeout after ${cancelTimeout}ms`, "TimeoutError")),
++      cancelTimeout,
++    )
++    try {
++      const response = await fetchFn(input.cancelUrl, {
++        method: "POST",
++        signal: cancelController.signal,
++      })
++      const detail = await response.text().catch(() => "")
++      if (response.ok) return { trigger, outcome: "cancelled", httpStatus: response.status, detail }
++      if (response.status === 404) return { trigger, outcome: "not_found", httpStatus: 404, detail }
++      return { trigger, outcome: "failed", httpStatus: response.status, detail }
++    } catch (error) {
++      return {
++        trigger,
++        outcome: "failed",
++        detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
++      }
++    } finally {
++      clearTimeout(timer)
++    }
++  }
++
++  return {
++    cancel(trigger: CompactionCancelTrigger, reason?: unknown) {
++      if (pending) return pending
++      pending = notifyService(trigger)
++      if (!input.requestController.signal.aborted) input.requestController.abort(reason)
++      return pending
++    },
++    pending() {
++      return pending
++    },
++  }
++}
+diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
+index 067d43d..05d3dd2 100644
+--- a/packages/opencode/src/session/compaction.ts
++++ b/packages/opencode/src/session/compaction.ts
+@@ -21,6 +21,10 @@
+ import { fn } from "@/util/fn"
+ import { EventV2 } from "@/v2/event"
+ import { SessionEvent } from "@/v2/session-event"
++import { SystemPrompt } from "./system"
++import { ToolRegistry } from "@/tool/registry"
++import { createCompactionCanceller, type CompactionCancelTrigger } from "./compaction-cancel"
++import * as EffectZod from "@/util/effect-zod"
+ 
+ const log = Log.create({ service: "session.compaction" })
+ 
+@@ -38,6 +42,8 @@
+ const TOOL_OUTPUT_MAX_CHARS = 2_000
+ const PRUNE_PROTECTED_TOOLS = ["skill"]
+ const DEFAULT_TAIL_TURNS = 2
++const DEFAULT_SERVICE_TIMEOUT = 30 * 60 * 1000
++const DEFAULT_TARGET_RATIO_PCT = 25
+ const MIN_PRESERVE_RECENT_TOKENS = 2_000
+ const MAX_PRESERVE_RECENT_TOKENS = 8_000
+ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+@@ -91,7 +97,15 @@
+   userIndex: number
+   assistantIndex: number
+   summary: string | undefined
+-}
++  messages: ExternalCompactionMessage[] | undefined
++}
++
++type ExternalCompactionMessage = {
++  role: string
++  content: unknown
++}
++
++const EXTERNAL_COMPACTION_MESSAGES_METADATA = MessageV2.EXTERNAL_COMPACTION_MESSAGES_METADATA
+ 
+ function summaryText(message: MessageV2.WithParts) {
+   const text = message.parts
+@@ -103,6 +117,22 @@
+   return text || undefined
+ }
+ 
++function externalCompactionMessages(message: MessageV2.WithParts) {
++  return message.parts
++    .filter((part): part is MessageV2.TextPart => part.type === "text")
++    .map((part) => part.metadata?.[EXTERNAL_COMPACTION_MESSAGES_METADATA])
++    .find((value): value is ExternalCompactionMessage[] => {
++      return (
++        Array.isArray(value) &&
++        value.every((item) => {
++          if (!item || typeof item !== "object") return false
++          if (!("role" in item) || typeof item.role !== "string") return false
++          return "content" in item
++        })
++      )
++    })
++}
++
+ function completedCompactions(messages: MessageV2.WithParts[]) {
+   const users = new Map<MessageID, number>()
+   for (let i = 0; i < messages.length; i++) {
+@@ -117,7 +147,7 @@
+     if (!msg.info.summary || !msg.info.finish || msg.info.error) return []
+     const userIndex = users.get(msg.info.parentID)
+     if (userIndex === undefined) return []
+-    return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
++    return [{ userIndex, assistantIndex, summary: summaryText(msg), messages: externalCompactionMessages(msg) }]
+   })
+ }
+ 
+@@ -218,6 +248,7 @@
+   | Plugin.Service
+   | SessionProcessor.Service
+   | Provider.Service
++  | ToolRegistry.Service
+ > = Layer.effect(
+   Service,
+   Effect.gen(function* () {
+@@ -228,6 +259,7 @@
+     const plugin = yield* Plugin.Service
+     const processors = yield* SessionProcessor.Service
+     const provider = yield* Provider.Service
++    const toolRegistry = yield* ToolRegistry.Service
+ 
+     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
+       tokens: MessageV2.Assistant["tokens"]
+@@ -391,11 +423,375 @@
+       const prior = completedCompactions(history)
+       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
+       const previousSummary = prior.at(-1)?.summary
++      const previousMessages = prior.at(-1)?.messages
+       const selected = yield* select({
+         messages: history.filter((_, index) => !hidden.has(index)),
+         cfg,
+         model,
+       })
++
++      // Explicit opt-in: without a service URL use the original built-in path.
++      const serviceUrl = cfg.compaction?.service_url?.trim()
++      if (serviceUrl) {
++        const serviceTimeout = cfg.compaction?.service_timeout ?? DEFAULT_SERVICE_TIMEOUT
++        const targetRatioPct = cfg.compaction?.target_ratio_pct ?? DEFAULT_TARGET_RATIO_PCT
++        log.info("using external compaction service", {
++          url: serviceUrl,
++          timeout: serviceTimeout,
++          targetRatioPct,
++        })
++
++        const emitError = Effect.fn("SessionCompaction.emitError")(function* (errorMessage: string) {
++          log.error("external compaction service failed", { error: errorMessage })
++          const now = Date.now()
++          const ctx2 = yield* InstanceState.context
++          yield* session.updateMessage({
++            id: MessageID.ascending(),
++            role: "assistant",
++            parentID: input.parentID,
++            sessionID: input.sessionID,
++            mode: "compaction",
++            agent: "compaction",
++            variant: userMessage.model.variant,
++            summary: true,
++            path: {
++              cwd: ctx2.directory,
++              root: ctx2.worktree,
++            },
++            cost: 0,
++            tokens: {
++              output: 0,
++              input: 0,
++              reasoning: 0,
++              cache: { read: 0, write: 0 },
++            },
++            modelID: model.id,
++            providerID: model.providerID,
++            time: {
++              created: now,
++              completed: now,
++            },
++            finish: "error",
++            error: new MessageV2.APIError({
++              message: errorMessage,
++              isRetryable: true,
++            }).toObject(),
++          })
++        })
++
++        const msgs = structuredClone(selected.head)
++        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
++        // Compact must see complete tool outputs before it decides what to retain.
++        const headModelMessages = yield* MessageV2.toModelMessagesEffect(msgs, model, {
++          stripMedia: true,
++        })
++
++        // Prepend the complete previous external-compaction output so the next
++        // compaction pass sees preserved assistant/tool context, not only summary text.
++        const previousModelMessages =
++          previousMessages ??
++          (previousSummary
++            ? [
++                {
++                  role: "user" as const,
++                  content: [{ type: "text" as const, text: previousSummary }],
++                },
++              ]
++            : [])
++        const modelMessages = [...previousModelMessages, ...headModelMessages]
++
++        const hasUserMessage = modelMessages.some((m: any) => m.role === "user")
++        if (!hasUserMessage || modelMessages.length === 0) {
++          yield* emitError("External compaction failed: no user messages in head after transformation")
++          return "stop" as const
++        }
++
++        const buildAgent = yield* agents.get(userMessage.agent)
++        const originalModel = yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID)
++        const systemPrompt = buildAgent.prompt ?? SystemPrompt.provider(originalModel).join("\n")
++
++        const allTools = yield* toolRegistry.tools({
++          providerID: originalModel.providerID,
++          modelID: originalModel.id,
++          agent: buildAgent,
++        })
++        const toolDefs = allTools.map((t) => ({
++          name: t.id,
++          description: t.description,
++          parameters: EffectZod.toJsonSchema(t.parameters),
++        }))
++
++        // Tag the request so it can be cancelled server-side. When the user
++        // cancels (the Effect is interrupted) or the timeout fires, we both abort
++        // the local fetch and POST /cancel/{id} so the compaction model inference
++        // is stopped on the GPU instead of running to completion.
++        const requestId = crypto.randomUUID()
++        const cancelUrl = `${serviceUrl.replace(/\/$/, "")}/cancel/${requestId}`
++        const serviceResult = yield* Effect.tryPromise({
++          try: async (interruptSignal) => {
++            const controller = new AbortController()
++            const canceller = createCompactionCanceller({ cancelUrl, requestController: controller })
++            let settled = false
++            const onAbort = (trigger: CompactionCancelTrigger, reason?: unknown) => {
++              if (settled) return
++              canceller.cancel(trigger, reason)
++            }
++            const onInterrupt = () => onAbort("interrupt", interruptSignal.reason)
++            if (interruptSignal.aborted) onInterrupt()
++            else interruptSignal.addEventListener("abort", onInterrupt, { once: true })
++            const timer =
++              serviceTimeout === false
++                ? undefined
++                : setTimeout(
++                    () => onAbort("timeout", new DOMException(`timeout after ${serviceTimeout}ms`, "TimeoutError")),
++                    serviceTimeout,
++                  )
++            try {
++              const resp = await fetch(`${serviceUrl.replace(/\/$/, "")}/compact`, {
++                method: "POST",
++                headers: { "Content-Type": "application/json" },
++                signal: controller.signal,
++                body: JSON.stringify({
++                  messages: modelMessages,
++                  system_prompt: systemPrompt,
++                  tool_defs: toolDefs,
++                  target_ratio_pct: targetRatioPct,
++                  request_id: requestId,
++                  debug: false,
++                }),
++                // @ts-ignore Bun-specific option; use AbortSignal above as the only timeout source.
++                timeout: false,
++              })
++              if (!resp.ok) {
++                const text = await resp.text().catch(() => "")
++                throw new Error(`Compaction service returned ${resp.status}: ${text.slice(0, 500)}`)
++              }
++              return (await resp.json()) as {
++                status: string
++                data: {
++                  messages: Array<{ role: string; content: any }>
++                  stats: Record<string, any>
++                }
++              }
++            } finally {
++              settled = true
++              if (timer !== undefined) clearTimeout(timer)
++              interruptSignal.removeEventListener("abort", onInterrupt)
++              const cancelResult = await canceller.pending()
++              if (cancelResult?.outcome === "cancelled") {
++                log.info("external compaction cancel acknowledged", {
++                  requestId,
++                  trigger: cancelResult.trigger,
++                  status: cancelResult.httpStatus,
++                })
++              } else if (cancelResult?.outcome === "not_found") {
++                log.info("external compaction already completed or was not registered when cancel arrived", {
++                  requestId,
++                  trigger: cancelResult.trigger,
++                  status: cancelResult.httpStatus,
++                })
++              } else if (cancelResult?.outcome === "failed") {
++                log.warn("external compaction cancel failed", {
++                  requestId,
++                  trigger: cancelResult.trigger,
++                  status: cancelResult.httpStatus,
++                  detail: cancelResult.detail,
++                })
++              }
++            }
++          },
++          catch: (err) =>
++            err instanceof Error && err.name === "TimeoutError" && serviceTimeout !== false
++              ? new Error(`External compaction service call timed out after ${serviceTimeout}ms`)
++              : new Error(`External compaction service call failed: ${err}`),
++        }).pipe(
++          Effect.map((r) => ({ ok: true as const, value: r })),
++          Effect.catch((err) => Effect.succeed({ ok: false as const, error: err.message })),
++        )
++
++        if (!serviceResult.ok) {
++          yield* emitError(serviceResult.error)
++          return "stop" as const
++        }
++        const serviceResponse = serviceResult.value
++
++        if (serviceResponse.status !== "ok" || !serviceResponse.data?.messages?.length) {
++          yield* emitError(
++            `External compaction service returned invalid response: status=${serviceResponse.status}, messages=${serviceResponse.data?.messages?.length ?? 0}`,
++          )
++          return "stop" as const
++        }
++
++        const svcData = serviceResponse.data
++        const summaryMsg = svcData.messages[0]
++        const summaryContent =
++          typeof summaryMsg?.content === "string"
++            ? summaryMsg.content
++            : Array.isArray(summaryMsg?.content)
++              ? summaryMsg.content
++                  .filter((item: any) => item?.type === "text")
++                  .map((item: any) => item.text)
++                  .join("\n\n")
++              : ""
++
++        const ctx = yield* InstanceState.context
++        const msg: MessageV2.Assistant = {
++          id: MessageID.ascending(),
++          role: "assistant",
++          parentID: input.parentID,
++          sessionID: input.sessionID,
++          mode: "compaction",
++          agent: "compaction",
++          variant: userMessage.model.variant,
++          summary: true,
++          path: {
++            cwd: ctx.directory,
++            root: ctx.worktree,
++          },
++          cost: 0,
++          tokens: {
++            output: 0,
++            input: 0,
++            reasoning: 0,
++            cache: { read: 0, write: 0 },
++          },
++          modelID: model.id,
++          providerID: model.providerID,
++          time: {
++            created: Date.now(),
++            completed: Date.now(),
++          },
++          finish: "end",
++        }
++        yield* session.updateMessage(msg)
++        yield* session.updatePart({
++          id: PartID.ascending(),
++          messageID: msg.id,
++          sessionID: input.sessionID,
++          type: "text",
++          text: summaryContent,
++          metadata: {
++            [EXTERNAL_COMPACTION_MESSAGES_METADATA]: svcData.messages,
++          },
++          time: { start: Date.now(), end: Date.now() },
++        })
++
++        if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
++          yield* session.updatePart({
++            ...compactionPart,
++            tail_start_id: selected.tail_start_id,
++          })
++        }
++
++        log.info("external compaction completed", {
++          stats: svcData.stats,
++          outputMessages: svcData.messages.length,
++        })
++
++        if (input.auto && replay) {
++          const original = replay.info
++          const replayMsg = yield* session.updateMessage({
++            id: MessageID.ascending(),
++            role: "user",
++            sessionID: input.sessionID,
++            time: { created: Date.now() },
++            agent: original.agent,
++            model: original.model,
++            format: original.format,
++            tools: original.tools,
++            system: original.system,
++          })
++          for (const part of replay.parts) {
++            if (part.type === "compaction") continue
++            const replayPart =
++              part.type === "file" && MessageV2.isMedia(part.mime)
++                ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
++                : part
++            yield* session.updatePart({
++              ...replayPart,
++              id: PartID.ascending(),
++              messageID: replayMsg.id,
++              sessionID: input.sessionID,
++            })
++          }
++        }
++
++        if (input.auto && !replay) {
++          const info = yield* provider.getProvider(userMessage.model.providerID)
++          if (
++            (yield* plugin.trigger(
++              "experimental.compaction.autocontinue",
++              {
++                sessionID: input.sessionID,
++                agent: userMessage.agent,
++                model: yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID),
++                provider: {
++                  source: info.source,
++                  info,
++                  options: info.options,
++                },
++                message: userMessage,
++                overflow: input.overflow === true,
++              },
++              { enabled: true },
++            )).enabled
++          ) {
++            const continueMsg = yield* session.updateMessage({
++              id: MessageID.ascending(),
++              role: "user",
++              sessionID: input.sessionID,
++              time: { created: Date.now() },
++              agent: userMessage.agent,
++              model: userMessage.model,
++            })
++            yield* session.updatePart({
++              id: PartID.ascending(),
++              messageID: continueMsg.id,
++              sessionID: input.sessionID,
++              type: "text",
++              metadata: { compaction_continue: true },
++              synthetic: true,
++              text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
++              time: {
++                start: Date.now(),
++                end: Date.now(),
++              },
++            })
++          }
++        }
++
++        EventV2.run(SessionEvent.Compaction.Ended.Sync, {
++          sessionID: input.sessionID,
++          timestamp: DateTime.makeUnsafe(Date.now()),
++          text: summaryContent,
++          include: selected.tail_start_id,
++        })
++        yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
++
++        yield* Effect.gen(function* () {
++          const codingAgentMessages = structuredClone(yield* MessageV2.filterCompactedEffect(input.sessionID))
++          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: codingAgentMessages })
++          const codingAgentModelMessages = yield* MessageV2.toModelMessagesEffect(codingAgentMessages, originalModel)
++          const codingAgentModelMessagesJSON = JSON.stringify(codingAgentModelMessages)
++          log.info("external compaction coding agent input", {
++            sessionID: input.sessionID,
++            agent: userMessage.agent,
++            providerID: originalModel.providerID,
++            modelID: originalModel.id,
++            tailStartID: selected.tail_start_id,
++            messageCount: codingAgentModelMessages.length,
++            estimatedTokens: Token.estimate(codingAgentModelMessagesJSON),
++          })
++        }).pipe(
++          Effect.catch((err) => {
++            log.error("external compaction coding agent input logging failed", { error: String(err) })
++            return Effect.void
++          }),
++        )
++
++        return "continue" as const
++      }
++
+       // Allow plugins to inject context or replace compaction prompt.
+       const compacting = yield* plugin.trigger(
+         "experimental.session.compacting",
+@@ -625,6 +1021,7 @@
+     Layer.provide(Plugin.defaultLayer),
+     Layer.provide(Bus.layer),
+     Layer.provide(Config.defaultLayer),
++    Layer.provide(ToolRegistry.defaultLayer),
+   ),
+ )
+ 
+diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
+index ed09262..094c7e7 100644
+--- a/packages/opencode/src/session/message-v2.ts
++++ b/packages/opencode/src/session/message-v2.ts
+@@ -36,6 +36,11 @@
+ }
+ 
+ export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached image(s) from tool result:"
++// Part metadata key under which the full message list returned by the external
++// compaction service is stored. When present on a summary message's text part,
++// toModelMessages expands the summary into these raw model messages instead of
++// emitting only the summary text.
++export const EXTERNAL_COMPACTION_MESSAGES_METADATA = "external_compaction_messages"
+ export { isMedia }
+ 
+ export const OutputLengthError = namedSchemaError("MessageOutputLengthError", {})
+@@ -754,6 +759,24 @@
+     return false
+   })()
+ 
++  // External-compaction expansion: a summary assistant message may carry the
++  // full message list returned by the compaction service. When it does, render
++  // those raw model messages in place of the summary text, and suppress the
++  // synthetic "What did we do so far?" text emitted for its paired compaction
++  // user message (the service output already begins with its own summary).
++  const externalInjections = new Map<string, ModelMessage[]>()
++  const suppressCompactionUsers = new Set<string>()
++  for (const msg of input) {
++    if (msg.info.role !== "assistant" || !msg.info.summary) continue
++    const raw = msg.parts
++      .filter((part): part is TextPart => part.type === "text")
++      .map((part) => part.metadata?.[EXTERNAL_COMPACTION_MESSAGES_METADATA])
++      .find((value): value is ModelMessage[] => Array.isArray(value) && value.length > 0)
++    if (!raw) continue
++    externalInjections.set(`${EXTERNAL_COMPACTION_MESSAGES_METADATA}:${msg.info.id}`, raw)
++    suppressCompactionUsers.add(msg.info.parentID)
++  }
++
+   const toModelOutput = (options: { toolCallId: string; input: unknown; output: unknown }) => {
+     const output = options.output
+     if (typeof output === "string") {
+@@ -821,7 +844,7 @@
+           }
+         }
+ 
+-        if (part.type === "compaction") {
++        if (part.type === "compaction" && !suppressCompactionUsers.has(msg.info.id)) {
+           userMessage.parts.push({
+             type: "text",
+             text: "What did we do so far?",
+@@ -837,6 +860,16 @@
+     }
+ 
+     if (msg.info.role === "assistant") {
++      const externalMarker = `${EXTERNAL_COMPACTION_MESSAGES_METADATA}:${msg.info.id}`
++      if (externalInjections.has(externalMarker)) {
++        result.push({
++          id: msg.info.id,
++          role: "assistant",
++          parts: [{ type: "text", text: externalMarker }],
++        })
++        continue
++      }
++
+       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
+       const media: Array<{ mime: string; url: string }> = []
+ 
+@@ -998,7 +1031,7 @@
+ 
+   const tools = Object.fromEntries(Array.from(toolNames).map((toolName) => [toolName, { toModelOutput }]))
+ 
+-  return yield* Effect.promise(() =>
++  const converted = yield* Effect.promise(() =>
+     convertToModelMessages(
+       result.filter((msg) => msg.parts.some((part) => part.type !== "step-start")),
+       {
+@@ -1007,6 +1040,21 @@
+       },
+     ),
+   )
++
++  if (externalInjections.size === 0) return converted
++  return converted.flatMap((message) => {
++    if (message.role !== "assistant") return [message]
++    const text =
++      typeof message.content === "string"
++        ? message.content
++        : Array.isArray(message.content) &&
++            message.content.length === 1 &&
++            message.content[0]?.type === "text"
++          ? message.content[0].text
++          : undefined
++    const injected = text ? externalInjections.get(text) : undefined
++    return injected ?? [message]
++  })
+ })
+ 
+ export function toModelMessages(
+diff --git a/packages/opencode/test/config/compaction.test.ts b/packages/opencode/test/config/compaction.test.ts
+new file mode 100644
+index 0000000..64eab9e
+--- /dev/null
++++ b/packages/opencode/test/config/compaction.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, test } from "bun:test"
++import { Config } from "../../src/config/config"
++
++describe("compaction config", () => {
++  test.each([1, 10, 25, 50, 99])("accepts target_ratio_pct=%d", (targetRatioPct) => {
++    const config = Config.Info.zod.parse({
++      compaction: { target_ratio_pct: targetRatioPct },
++    })
++
++    expect(config.compaction?.target_ratio_pct).toBe(targetRatioPct)
++  })
++
++  test.each([0, 100, 25.5])("rejects target_ratio_pct=%s", (targetRatioPct) => {
++    expect(() =>
++      Config.Info.zod.parse({
++        compaction: { target_ratio_pct: targetRatioPct },
++      }),
++    ).toThrow()
++  })
++
++  test("keeps target_ratio_pct optional so the runtime default remains 25", () => {
++    const config = Config.Info.zod.parse({ compaction: {} })
++
++    expect(config.compaction?.target_ratio_pct).toBeUndefined()
++  })
++})
+diff --git a/packages/opencode/test/session/compaction-cancel.test.ts b/packages/opencode/test/session/compaction-cancel.test.ts
+new file mode 100644
+index 0000000..bd583f1
+--- /dev/null
++++ b/packages/opencode/test/session/compaction-cancel.test.ts
+@@ -0,0 +1,96 @@
++import { describe, expect, test } from "bun:test"
++import { createCompactionCanceller } from "../../src/session/compaction-cancel"
++
++describe("external compaction cancellation", () => {
++  test("does not call cancel before an interrupt or timeout", () => {
++    let calls = 0
++    const canceller = createCompactionCanceller({
++      cancelUrl: "http://compaction.test/cancel/normal",
++      requestController: new AbortController(),
++      fetchFn: async () => {
++        calls++
++        return new Response("{}", { status: 200 })
++      },
++    })
++
++    expect(canceller.pending()).toBeUndefined()
++    expect(calls).toBe(0)
++  })
++
++  test("aborts the compact request and acknowledges cancel exactly once", async () => {
++    const requestController = new AbortController()
++    const reason = new DOMException("user stopped", "AbortError")
++    const calls: Array<{ url: string; signal: AbortSignal | null }> = []
++    const canceller = createCompactionCanceller({
++      cancelUrl: "http://compaction.test/cancel/request-1",
++      requestController,
++      fetchFn: async (url, init) => {
++        calls.push({ url: String(url), signal: init?.signal ?? null })
++        return new Response('{"cancelled":true}', { status: 200 })
++      },
++    })
++
++    const first = canceller.cancel("interrupt", reason)
++    const second = canceller.cancel("timeout", new DOMException("late timeout", "TimeoutError"))
++
++    expect(first).toBe(second)
++    expect(requestController.signal.aborted).toBe(true)
++    expect(requestController.signal.reason).toBe(reason)
++    const result = await first
++    expect(result).toMatchObject({ trigger: "interrupt", outcome: "cancelled", httpStatus: 200 })
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.url).toBe("http://compaction.test/cancel/request-1")
++    expect(calls[0]?.signal).not.toBe(requestController.signal)
++  })
++
++  test("treats 404 as an already completed or unregistered request", async () => {
++    const canceller = createCompactionCanceller({
++      cancelUrl: "http://compaction.test/cancel/finished",
++      requestController: new AbortController(),
++      fetchFn: async () => new Response('{"detail":"not found"}', { status: 404 }),
++    })
++
++    await expect(canceller.cancel("interrupt")).resolves.toMatchObject({
++      outcome: "not_found",
++      httpStatus: 404,
++    })
++  })
++
++  test("reports a non-404 server failure without throwing", async () => {
++    const canceller = createCompactionCanceller({
++      cancelUrl: "http://compaction.test/cancel/failure",
++      requestController: new AbortController(),
++      fetchFn: async () => new Response("unavailable", { status: 503 }),
++    })
++
++    await expect(canceller.cancel("timeout")).resolves.toMatchObject({
++      trigger: "timeout",
++      outcome: "failed",
++      httpStatus: 503,
++    })
++  })
++
++  test("bounds an unresponsive cancel request with an independent timeout", async () => {
++    const requestController = new AbortController()
++    let cancelSignal: AbortSignal | undefined
++    const canceller = createCompactionCanceller({
++      cancelUrl: "http://compaction.test/cancel/slow",
++      requestController,
++      cancelTimeout: 10,
++      fetchFn: async (_url, init) => {
++        cancelSignal = init?.signal ?? undefined
++        return await new Promise<Response>((_resolve, reject) => {
++          cancelSignal?.addEventListener("abort", () => reject(cancelSignal?.reason), { once: true })
++        })
++      },
++    })
++
++    const result = await canceller.cancel("interrupt", new DOMException("stop", "AbortError"))
++
++    expect(requestController.signal.aborted).toBe(true)
++    expect(cancelSignal).not.toBe(requestController.signal)
++    expect(cancelSignal?.aborted).toBe(true)
++    expect(result.outcome).toBe("failed")
++    expect(result.detail).toContain("TimeoutError")
++  })
++})
+diff --git a/packages/opencode/test/session/compaction.test.ts b/packages/opencode/test/session/compaction.test.ts
+index cde9c13..22698f1 100644
+--- a/packages/opencode/test/session/compaction.test.ts
++++ b/packages/opencode/test/session/compaction.test.ts
+@@ -1,6 +1,6 @@
+ import { afterEach, describe, expect, mock, test } from "bun:test"
+ import { APICallError } from "ai"
+-import { Cause, Effect, Exit, Layer, ManagedRuntime } from "effect"
++import { Cause, Effect, Exit, Layer, ManagedRuntime, Schema } from "effect"
+ import * as Stream from "effect/Stream"
+ import z from "zod"
+ import { Bus } from "../../src/bus"
+@@ -29,6 +29,7 @@
+ import { testEffect } from "../lib/effect"
+ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+ import { TestConfig } from "../fixture/config"
++import { ToolRegistry } from "@/tool/registry"
+ 
+ void Log.init({ print: false })
+ 
+@@ -58,6 +59,16 @@
+     summarize: () => Effect.void,
+     diff: () => Effect.succeed([]),
+     computeDiff: () => Effect.succeed([]),
++  }),
++)
++
++const toolRegistry = Layer.succeed(
++  ToolRegistry.Service,
++  ToolRegistry.Service.of({
++    ids: () => Effect.succeed([]),
++    all: () => Effect.succeed([]),
++    named: () => Effect.die(new Error("ToolRegistry.named is not used by compaction tests")),
++    tools: () => Effect.succeed([]),
+   }),
+ )
+ 
+@@ -95,7 +106,7 @@
+       input: { text: true, image: false, audio: false, video: false },
+       output: { text: true, image: false, audio: false, video: false },
+     },
+-    api: { npm: opts.npm ?? "@ai-sdk/anthropic" },
++    api: { id: "test-model", url: "http://127.0.0.1", npm: opts.npm ?? "@ai-sdk/anthropic" },
+     options: {},
+   } as Provider.Model
+ }
+@@ -221,10 +232,11 @@
+   plugin = Plugin.defaultLayer,
+   provider = ProviderTest.fake(),
+   config = Config.defaultLayer,
++  registry = toolRegistry,
+ ) {
+   const bus = Bus.layer
+   return ManagedRuntime.make(
+-    Layer.mergeAll(SessionCompaction.layer, bus).pipe(
++    Layer.mergeAll(SessionCompaction.layer.pipe(Layer.provide(registry)), bus).pipe(
+       Layer.provide(provider.layer),
+       Layer.provide(SessionNs.defaultLayer),
+       Layer.provide(layer(result)),
+@@ -248,7 +260,11 @@
+ const env = Layer.mergeAll(
+   SessionNs.defaultLayer,
+   CrossSpawnSpawner.defaultLayer,
+-  SessionCompaction.layer.pipe(Layer.provide(SessionNs.defaultLayer), Layer.provideMerge(deps)),
++  SessionCompaction.layer.pipe(
++    Layer.provide(toolRegistry),
++    Layer.provide(SessionNs.defaultLayer),
++    Layer.provideMerge(deps),
++  ),
+ )
+ 
+ const it = testEffect(env)
+@@ -280,7 +296,12 @@
+   const status = SessionStatus.layer.pipe(Layer.provide(bus))
+   const processor = SessionProcessorModule.SessionProcessor.layer.pipe(Layer.provide(summary))
+   return ManagedRuntime.make(
+-    Layer.mergeAll(SessionCompaction.layer.pipe(Layer.provide(processor)), processor, bus, status).pipe(
++    Layer.mergeAll(
++      SessionCompaction.layer.pipe(Layer.provide(toolRegistry), Layer.provide(processor)),
++      processor,
++      bus,
++      status,
++    ).pipe(
+       Layer.provide(provider.layer),
+       Layer.provide(SessionNs.defaultLayer),
+       Layer.provide(Snapshot.defaultLayer),
+@@ -2193,3 +2214,322 @@
+     expect(result.tokens.cache.write).toBe(300)
+   })
+ })
++
++describe("external compaction integration", () => {
++  test("sends complete tool descriptions and nested parameter schemas to the service", async () => {
++    const requests: Array<{ tool_defs: Array<{ name: string; description: string; parameters: unknown }> }> = []
++    const description = "Read a project file and respect its constraints. ".repeat(10) + "Important final warning."
++    const definition = {
++      id: "read_file",
++      description,
++      parameters: Schema.Struct({
++        path: Schema.String.annotate({ description: "Project-relative file path" }),
++        options: Schema.optional(Schema.Struct({ mode: Schema.Literals(["text", "binary"]) })),
++      }),
++      execute: () => Effect.die(new Error("Compaction must not execute tools")),
++    }
++    const registry = Layer.succeed(
++      ToolRegistry.Service,
++      ToolRegistry.Service.of({
++        ids: () => Effect.succeed([definition.id]),
++        all: () => Effect.succeed([definition]),
++        named: () => Effect.die(new Error("Compaction does not use named tools")),
++        tools: () => Effect.succeed([definition]),
++      }),
++    )
++    const server = Bun.serve({
++      port: 0,
++      async fetch(request) {
++        requests.push(await request.json())
++        return Response.json({
++          status: "ok",
++          data: { messages: [{ role: "user", content: "Parser work is summarized." }], stats: {} },
++        })
++      },
++    })
++    await using tmp = await tmpdir({ git: true })
++    try {
++      await WithInstance.provide({
++        directory: tmp.path,
++        fn: async () => {
++          const session = await svc.create({})
++          const first = await user(session.id, "Inspect the parser.")
++          const reply = await assistant(session.id, first.id, tmp.path)
++          await svc.updatePart({
++            id: PartID.ascending(),
++            messageID: reply.id,
++            sessionID: session.id,
++            type: "text",
++            text: "The parser still needs to be inspected.",
++          })
++          await SessionCompaction.create({ sessionID: session.id, agent: "build", model: ref, auto: false })
++          const messages = MessageV2.filterCompacted(MessageV2.stream(session.id))
++          const rt = runtime(
++            "continue",
++            Plugin.defaultLayer,
++            wide(),
++            cfg({ service_url: `http://127.0.0.1:${server.port}`, tail_turns: 0 }),
++            registry,
++          )
++          try {
++            expect(
++              await rt.runPromise(
++                SessionCompaction.Service.use((service) =>
++                  service.process({
++                    parentID: messages.at(-1)!.info.id,
++                    messages,
++                    sessionID: session.id,
++                    auto: false,
++                  }),
++                ),
++              ),
++            ).toBe("continue")
++            expect(requests).toHaveLength(1)
++            expect(requests[0].tool_defs).toHaveLength(1)
++            expect(requests[0].tool_defs[0].description).toBe(description)
++            expect(requests[0].tool_defs[0].parameters).toMatchObject({
++              type: "object",
++              properties: {
++                path: { type: "string", description: "Project-relative file path" },
++                options: {
++                  type: "object",
++                  properties: { mode: { type: "string", enum: ["text", "binary"] } },
++                  required: ["mode"],
++                },
++              },
++              required: ["path"],
++            })
++          } finally {
++            await rt.dispose()
++          }
++        },
++      })
++    } finally {
++      server.stop(true)
++    }
++  })
++
++  test("replays the latest user request after automatic overflow compaction without a retained tail", async () => {
++    const requests: Array<{ messages: Array<{ role: string; content: unknown }> }> = []
++    const server = Bun.serve({
++      port: 0,
++      async fetch(request) {
++        requests.push(await request.json())
++        return Response.json({
++          status: "ok",
++          data: { messages: [{ role: "user", content: "Earlier parser work is summarized." }], stats: {} },
++        })
++      },
++    })
++    await using tmp = await tmpdir({ git: true })
++    try {
++      await WithInstance.provide({
++        directory: tmp.path,
++        fn: async () => {
++          const session = await svc.create({})
++          const first = await user(session.id, "Fix empty parser input.")
++          const reply = await assistant(session.id, first.id, tmp.path)
++          await svc.updatePart({
++            id: PartID.ascending(),
++            messageID: reply.id,
++            sessionID: session.id,
++            type: "text",
++            text: "The empty-input error is located; the fix is pending.",
++          })
++          const latest = await user(session.id, "Keep the parse(text) signature unchanged.")
++          await svc.updateMessage({ ...latest, system: "Preserve the public API.", tools: { read: true } })
++          await svc.updatePart({
++            id: PartID.ascending(),
++            messageID: latest.id,
++            sessionID: session.id,
++            type: "file",
++            mime: "image/png",
++            filename: "parser.png",
++            url: "https://example.com/parser.png",
++          })
++          await SessionCompaction.create({
++            sessionID: session.id,
++            agent: "build",
++            model: ref,
++            auto: true,
++            overflow: true,
++          })
++          const messages = MessageV2.filterCompacted(MessageV2.stream(session.id))
++          const rt = runtime(
++            "continue",
++            Plugin.defaultLayer,
++            wide(),
++            cfg({ service_url: `http://127.0.0.1:${server.port}`, tail_turns: 0 }),
++          )
++          try {
++            expect(
++              await rt.runPromise(
++                SessionCompaction.Service.use((service) =>
++                  service.process({
++                    parentID: messages.at(-1)!.info.id,
++                    messages,
++                    sessionID: session.id,
++                    auto: true,
++                    overflow: true,
++                  }),
++                ),
++              ),
++            ).toBe("continue")
++            expect(requests).toHaveLength(1)
++            expect(JSON.stringify(requests[0].messages)).not.toContain("Keep the parse(text) signature unchanged.")
++            const visible = MessageV2.filterCompacted(MessageV2.stream(session.id))
++            const model = await rt.runPromise(
++              MessageV2.toModelMessagesEffect(visible, createModel({ context: 100_000, output: 32_000 })),
++            )
++            expect(JSON.stringify(model)).toContain("Keep the parse(text) signature unchanged.")
++            expect(JSON.stringify(model)).toContain("Attached image/png: parser.png")
++            expect(visible.at(-1)?.info).toMatchObject({
++              role: "user",
++              system: "Preserve the public API.",
++              tools: { read: true },
++              model: ref,
++              agent: "build",
++            })
++            expect(visible.at(-1)?.parts.some((part) => part.type === "file")).toBe(false)
++          } finally {
++            await rt.dispose()
++          }
++        },
++      })
++    } finally {
++      server.stop(true)
++    }
++  })
++
++  test("opts in, stores returned messages, and carries them into a second compaction", async () => {
++    const requests: any[] = []
++    const liveUrl = process.env.COMPACT_INTEGRATION_URL
++    const server = liveUrl
++      ? undefined
++      : Bun.serve({
++          port: 0,
++          async fetch(request) {
++            const data = await request.json()
++            requests.push(data)
++            return Response.json({
++              status: "ok",
++              data: {
++                messages: [
++                  { role: "user", content: `public-summary-${requests.length}` },
++                  ...data.messages,
++                  { role: "assistant", content: "Keep the parse(text) signature. Tests are pending." },
++                ],
++                stats: {},
++              },
++            })
++          },
++        })
++    await using tmp = await tmpdir({ git: true })
++    try {
++      await WithInstance.provide({
++        directory: tmp.path,
++        fn: async () => {
++          const session = await svc.create({})
++          const originalUser = await user(
++            session.id,
++            "Fix empty input in fictional src/parser.py; preserve parse(text).",
++          )
++          const originalAssistant = await assistant(session.id, originalUser.id, tmp.path)
++          await svc.updatePart({
++            id: PartID.ascending(),
++            messageID: originalAssistant.id,
++            sessionID: session.id,
++            type: "text",
++            text: "Current code returns text.splitlines()[0]. No changes made yet. Add an empty-input guard and tests.",
++          })
++          await svc.updatePart({
++            id: PartID.ascending(),
++            messageID: originalAssistant.id,
++            sessionID: session.id,
++            type: "tool",
++            callID: "long-output-call",
++            tool: "bash",
++            state: {
++              status: "completed",
++              input: { command: "cat fictional-test-output" },
++              output: "x".repeat(2500) + "IMPORTANT_RESULT_AT_END",
++              title: "Synthetic long output",
++              metadata: {},
++              time: { start: 0, end: 1 },
++            },
++          })
++          const rt = runtime(
++            "continue",
++            Plugin.defaultLayer,
++            wide(),
++            cfg({
++              service_url: liveUrl ?? `http://127.0.0.1:${server!.port}`,
++              target_ratio_pct: 25,
++              service_timeout: 120000,
++            }),
++          )
++          try {
++            for (let round = 0; round < 2; round++) {
++              if (round) {
++                const nextUser = await user(session.id, "Continue with the empty-input fix and run tests.")
++                const nextAssistant = await assistant(session.id, nextUser.id, tmp.path)
++                await svc.updatePart({
++                  id: PartID.ascending(),
++                  messageID: nextAssistant.id,
++                  sessionID: session.id,
++                  type: "text",
++                  text: "The fix is pending. I will add an empty-input check, then test empty and normal strings.",
++                })
++              }
++              await SessionCompaction.create({ sessionID: session.id, agent: "build", model: ref, auto: false })
++              const msgs = MessageV2.filterCompacted(MessageV2.stream(session.id))
++              const result = await rt.runPromise(
++                SessionCompaction.Service.use((service) =>
++                  service.process({
++                    parentID: msgs.at(-1)!.info.id,
++                    messages: msgs,
++                    sessionID: session.id,
++                    auto: false,
++                  }),
++                ),
++              )
++              if (result !== "continue") {
++                const failed = await svc.messages({ sessionID: session.id })
++                throw new Error(
++                  JSON.stringify(
++                    failed
++                      .filter((m) => m.info.role === "assistant")
++                      .map((m) => (m.info.role === "assistant" ? m.info.error : null)),
++                  ),
++                )
++              }
++              expect(result).toBe("continue")
++              const stored = await svc.messages({ sessionID: session.id })
++              const summaries = stored.filter((m) => m.info.role === "assistant" && m.info.summary)
++              const parts = summaries.at(-1)!.parts
++              expect(
++                parts.some(
++                  (part) =>
++                    part.type === "text" &&
++                    Array.isArray(part.metadata?.[MessageV2.EXTERNAL_COMPACTION_MESSAGES_METADATA]),
++                ),
++              ).toBe(true)
++            }
++            if (!liveUrl) {
++              expect(requests).toHaveLength(2)
++              expect(requests[0].target_ratio_pct).toBe(25)
++              expect(requests[0].request_id).not.toBe(requests[1].request_id)
++              expect(JSON.stringify(requests[1].messages)).toContain("public-summary-1")
++              expect(JSON.stringify(requests[0].messages)).toContain("IMPORTANT_RESULT_AT_END")
++              expect(JSON.stringify(requests[1].messages)).toContain("IMPORTANT_RESULT_AT_END")
++            }
++          } finally {
++            await rt.dispose()
++          }
++        },
++      })
++    } finally {
++      server?.stop(true)
++    }
++  }, 300000)
++})

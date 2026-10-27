@@ -1,0 +1,7 @@
+aiXcompact
+Copyright 2026 aiXcoder
+
+Project code is licensed under Apache-2.0.
+The OpenCode patch modifies MIT-licensed OpenCode code; its upstream license is preserved in patches/LICENSE.opencode.
+vLLM, Qwen3.5-4B and its tokenizer use Apache-2.0. The tokenizer is read from the model bundle; retain the upstream license when redistributing model assets.
+No upstream project endorsement is implied.

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=84.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aixcoder-compact"
+version = "0.1.0"
+description = "Structured context compaction for coding agents"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["fastapi==0.133.0", "starlette==1.6.0", "uvicorn==0.34.3", "httpx==0.28.1", "pydantic==2.11.7", "tokenizers==0.21.2"]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.1", "pytest-asyncio==1.0.0"]
+
+[project.scripts]
+aixcoder-compact = "service.main:main"
+
+[tool.setuptools.packages.find]
+include = ["service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,6 @@
+fastapi==0.133.0
+starlette==1.6.0
+uvicorn==0.34.3
+httpx==0.28.1
+pydantic==2.11.7
+tokenizers==0.21.2

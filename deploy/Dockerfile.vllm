@@ -1,0 +1,5 @@
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.22.1
+FROM ${VLLM_BASE_IMAGE}
+COPY patches/vllm-0.22.1-gdn-ngram.patch patches/vllm-files.json /opt/compact-patches/
+COPY deploy/apply_vllm_patch.py /opt/apply_vllm_patch.py
+RUN python3 /opt/apply_vllm_patch.py /opt/compact-patches

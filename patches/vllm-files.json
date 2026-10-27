@@ -1,0 +1,32 @@
+[
+  {
+    "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+    "before_sha256": "ece0f73e29db64fb84d010c49081b249a9472a17b8730407712e9f923ac10bc2",
+    "after_sha256": "3abf5245010fbc50b765d07cff75045985a8ba1599c752842727bae96726d01e"
+  },
+  {
+    "path": "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+    "before_sha256": "7b70ef2305f03fe907a7baa30d72b852bfdc95c54a824a26e7826334d0cfec44",
+    "after_sha256": "d16923e31ad14046667393582bfac9869e755813920412ac4890c96ad72aa63a"
+  },
+  {
+    "path": "vllm/model_executor/models/qwen3_5.py",
+    "before_sha256": "eaf9885c0dc2be01cbce6b8d3ce9ad051074f098f61bcc4e3826ada566940e1e",
+    "after_sha256": "9a51accf0a96d97c204c6e152416be2baf690ff9d8ba012ec7716b0fcd031447"
+  },
+  {
+    "path": "vllm/model_executor/models/registry.py",
+    "before_sha256": "aadb76f95f6da37b8acf83d186e4d5901736e376e52d8bc5ccadc22f7c36cdb5",
+    "after_sha256": "ca1de359bed65b11b6351e74ecf8cf43c0ecac21fee3b145bf82a41a78d2bc9e"
+  },
+  {
+    "path": "vllm/v1/attention/backends/gdn_attn.py",
+    "before_sha256": "f9a3a2fbbdacef31c009b9efd5e32e7a50430d90215899fed23d0d6402fea7ab",
+    "after_sha256": "04681e46992cb7fbe2098690897a32ffcb83692353d83b2c12f9b64eef9dedf6"
+  },
+  {
+    "path": "vllm/v1/worker/gpu_model_runner.py",
+    "before_sha256": "690998ae7d9353ce42d7fc43f755fdbd72097c6e1f7a364dde435743408b00f2",
+    "after_sha256": "05cd199c1fabdc99b5da7817236f885c51a3fd56417709b913cb7b8f9b0abe8f"
+  }
+]

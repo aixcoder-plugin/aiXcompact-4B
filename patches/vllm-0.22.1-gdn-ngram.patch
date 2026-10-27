@@ -1,0 +1,352 @@
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1317,6 +1317,14 @@
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         num_accepted_tokens = attn_metadata.num_accepted_tokens
++        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
++        non_spec_num_accepted_tokens = attn_metadata.non_spec_num_accepted_tokens
++
++        if spec_decode_src_indices is not None:
++            assert non_spec_state_indices_tensor is not None
++            n_correct = spec_decode_src_indices.shape[0]
++            dst_indices = non_spec_state_indices_tensor[:n_correct]
++            ssm_state[dst_indices] = ssm_state[spec_decode_src_indices]
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+@@ -1363,6 +1371,11 @@
+             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+             # - "cache_indices" updates the conv_state cache in positions
+             #   pointed to by "state_indices_tensor"
++            conv_num_accepted_tokens = (
++                non_spec_num_accepted_tokens
++                if spec_decode_src_indices is not None
++                else None
++            )
+             mixed_qkv_non_spec = causal_conv1d_fn(
+                 mixed_qkv_non_spec_T,
+                 conv_weights,
+@@ -1372,10 +1385,16 @@
+                 has_initial_state=has_initial_state,
+                 cache_indices=non_spec_state_indices_tensor,
+                 query_start_loc=non_spec_query_start_loc,
++                num_accepted_tokens=conv_num_accepted_tokens,
+                 metadata=attn_metadata,
+             ).transpose(0, 1)
+         elif attn_metadata.num_decodes > 0:
+             assert mixed_qkv_non_spec is not None
++            conv_num_accepted_tokens = (
++                non_spec_num_accepted_tokens
++                if spec_decode_src_indices is not None
++                else None
++            )
+             mixed_qkv_non_spec = causal_conv1d_update(
+                 mixed_qkv_non_spec,
+                 conv_state,
+@@ -1385,6 +1404,7 @@
+                 conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+                 ],
++                num_accepted_tokens=conv_num_accepted_tokens,
+                 validate_data=True,
+             )
+         else:
+@@ -1611,6 +1631,14 @@
+         )
+         ssm_state = self_kv_cache[1]
+         num_actual_tokens = attn_metadata.num_actual_tokens
++        spec_decode_src_indices = attn_metadata.spec_decode_src_indices
++        non_spec_num_accepted_tokens = attn_metadata.non_spec_num_accepted_tokens
++
++        if spec_decode_src_indices is not None:
++            assert non_spec_state_indices_tensor is not None
++            n_correct = spec_decode_src_indices.shape[0]
++            dst_indices = non_spec_state_indices_tensor[:n_correct]
++            ssm_state[dst_indices] = ssm_state[spec_decode_src_indices]
+ 
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+@@ -1618,6 +1646,11 @@
+ 
+         conv_weights = self.conv1d.weight.view(
+             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++        )
++        conv_num_accepted_tokens = (
++            non_spec_num_accepted_tokens
++            if spec_decode_src_indices is not None
++            else None
+         )
+         mixed_qkv_non_spec = causal_conv1d_update(
+             mixed_qkv,
+@@ -1626,6 +1659,7 @@
+             self.conv1d.bias,
+             self.activation,
+             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
++            num_accepted_tokens=conv_num_accepted_tokens,
+             validate_data=False,
+         )
+         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+--- a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -30,6 +30,7 @@
+     block_idx_last_scheduled_token,  # (batch,)
+     initial_state_idx,  # (batch,)
+     num_computed_tokens,  # (batch,)
++    num_accepted_tokens_ptr,  # (batch,) or None
+     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+     # Matrix dimensions
+     dim: tl.constexpr,
+@@ -55,6 +56,7 @@
+     KERNEL_WIDTH: tl.constexpr,
+     SILU_ACTIVATION: tl.constexpr,
+     IS_APC_ENABLED: tl.constexpr,
++    IS_SPEC_DECODING: tl.constexpr,
+     HAS_NULL_BLOCK: tl.constexpr,
+     NP2_STATELEN: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+@@ -74,6 +76,12 @@
+ 
+     # single-sequence id
+     idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
++    if IS_SPEC_DECODING:
++        conv_state_token_offset = (
++            tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1
++        )
++    else:
++        conv_state_token_offset = 0
+     chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
+ 
+     # BLOCK_N elements along the feature-dimension (channel)
+@@ -154,7 +162,11 @@
+         load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+         if load_init_state:
+             # load from conv_states
+-            prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
++            prior_tokens = (
++                conv_states_base
++                + (state_len - 1 + conv_state_token_offset)
++                * stride_conv_state_tok
++            )
+             mask_w = idx_feats < dim
+             if KERNEL_WIDTH == 2:
+                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
+@@ -244,7 +256,10 @@
+                     conv_states_ptr
+                     + (conv_states_input_coord * stride_conv_state_seq)
+                     + (idx_feats * stride_conv_state_dim)[None, :]
+-                    + ((idx_tokens_conv + seqlen) * stride_conv_state_tok)[:, None]
++                    + (
++                        (idx_tokens_conv + seqlen + conv_state_token_offset)
++                        * stride_conv_state_tok
++                    )[:, None]
+                 )  # [BLOCK_M, BLOCK_N]
+                 mask = (
+                     (conv_states_input_coord < num_cache_lines)
+@@ -481,6 +496,7 @@
+     block_idx_last_scheduled_token: torch.Tensor | None = None,
+     initial_state_idx: torch.Tensor | None = None,
+     num_computed_tokens: torch.Tensor | None = None,
++    num_accepted_tokens: torch.Tensor | None = None,
+     block_size_to_align=0,
+     metadata=None,
+     validate_data=False,
+@@ -712,6 +728,7 @@
+         block_idx_last_scheduled_token,
+         initial_state_idx,
+         num_computed_tokens,
++        num_accepted_tokens,
+         out,
+         # Matrix dimensions
+         dim,
+@@ -737,6 +754,7 @@
+         KERNEL_WIDTH=width,
+         SILU_ACTIVATION=activation in ["silu", "swish"],
+         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
++        IS_SPEC_DECODING=num_accepted_tokens is not None,
+         HAS_NULL_BLOCK=null_block_id is not None,
+         NP2_STATELEN=np2_statelen,
+         # launch_cooperative_grid=True
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -75,6 +75,7 @@
+     MultiModalEmbeddings,
+     SupportsEagle3,
+     SupportsLoRA,
++    SupportsMRoPE,
+     SupportsPP,
+     _require_is_multimodal,
+ )
+@@ -435,6 +436,7 @@
+     HasInnerState,
+     SupportsEagle3,
+     SupportsLoRA,
++    SupportsMRoPE,
+     SupportsPP,
+ ):
+     packed_modules_mapping = {
+@@ -525,8 +527,51 @@
+         return loader.load_weights(weights)
+ 
+ 
+-class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
+-    pass
++class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, IsHybrid, SupportsMRoPE):
++    """Standalone text-only merged checkpoints (no vision processor)."""
++
++    def get_mrope_input_positions(self, input_tokens, mm_features):
++        if mm_features:
++            raise ValueError("This checkpoint only supports text inputs")
++        positions = torch.arange(len(input_tokens), dtype=torch.long)
++        return positions.unsqueeze(0).expand(3, -1).contiguous(), 0
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(
++        cls,
++        vllm_config: "VllmConfig",
++    ) -> tuple[torch.dtype, torch.dtype]:
++        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++            vllm_config.model_config.dtype,
++            vllm_config.cache_config.mamba_cache_dtype,
++            vllm_config.cache_config.mamba_ssm_cache_dtype,
++        )
++
++    @classmethod
++    def get_mamba_state_shape_from_config(
++        cls, vllm_config: "VllmConfig"
++    ) -> tuple[tuple[int, int], tuple[int, int]]:
++        parallel_config = vllm_config.parallel_config
++        hf_config = vllm_config.model_config.hf_text_config
++        tp_size = parallel_config.tensor_parallel_size
++        num_spec = (
++            vllm_config.speculative_config.num_speculative_tokens
++            if vllm_config.speculative_config
++            else 0
++        )
++        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++            tp_size,
++            hf_config.linear_num_key_heads,
++            hf_config.linear_num_value_heads,
++            hf_config.linear_key_head_dim,
++            hf_config.linear_value_head_dim,
++            hf_config.linear_conv_kernel_dim,
++            num_spec,
++        )
++
++    @classmethod
++    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
++        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+ 
+ 
+ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -202,6 +202,7 @@
+     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
+     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
+     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
++    "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+     "Qwen3MoeForCausalLM": ("qwen3_moe", "Qwen3MoeForCausalLM"),
+     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
+     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -63,6 +63,12 @@
+     non_spec_token_indx: torch.Tensor | None = None
+ 
+     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
++    # Source block indices used after speculative decoding accepted tokens.
++    # Non-spec GDN paths copy SSM state from these blocks before the next step.
++    spec_decode_src_indices: torch.Tensor | None = None
++    # Accepted-token counts matching non_spec_state_indices_tensor. This is
++    # separate from num_accepted_tokens, which is consumed by spec rows.
++    non_spec_num_accepted_tokens: torch.Tensor | None = None
+ 
+     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
+     chunk_indices: torch.Tensor | None = None
+@@ -215,8 +221,35 @@
+             spec_query_start_loc = None
+             non_spec_query_start_loc = query_start_loc
+             non_spec_query_start_loc_cpu = query_start_loc_cpu
++            spec_decode_src_indices = None
++            non_spec_num_accepted_tokens = None
++            if (
++                self.use_spec_decode
++                and num_accepted_tokens is not None
++                and num_decodes > 0
++            ):
++                decode_num_accepted = num_accepted_tokens[:num_decodes]
++                col_indices = (decode_num_accepted - 1).clamp(min=0)
++                spec_decode_src_indices = block_table_tensor[
++                    torch.arange(num_decodes, device=block_table_tensor.device),
++                    col_indices,
++                ]
++                non_spec_num_accepted_tokens = decode_num_accepted
++                if num_prefills > 0:
++                    non_spec_num_accepted_tokens = torch.cat(
++                        [
++                            non_spec_num_accepted_tokens,
++                            torch.ones(
++                                num_prefills,
++                                dtype=non_spec_num_accepted_tokens.dtype,
++                                device=non_spec_num_accepted_tokens.device,
++                            ),
++                        ]
++                    )
+             num_accepted_tokens = None
+         else:
++            spec_decode_src_indices = None
++            non_spec_num_accepted_tokens = None
+             query_lens = query_start_loc[1:] - query_start_loc[:-1]
+             assert spec_sequence_masks_cpu is not None
+             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+@@ -286,6 +319,14 @@
+                 non_spec_state_indices_tensor = block_table_tensor[
+                     ~spec_sequence_masks_cpu, 0
+                 ]
++                assert num_accepted_tokens is not None
++                non_spec_num_accepted_tokens = num_accepted_tokens[
++                    ~spec_sequence_masks_cpu
++                ]
++                col_indices = (non_spec_num_accepted_tokens - 1).clamp(min=0)
++                spec_decode_src_indices = block_table_tensor[
++                    ~spec_sequence_masks_cpu
++                ].gather(1, col_indices[:, None])[:, 0]
+ 
+                 spec_query_start_loc = torch.zeros(
+                     num_spec_decodes + 1,
+@@ -466,6 +507,8 @@
+             spec_token_indx=spec_token_indx,
+             non_spec_token_indx=non_spec_token_indx,
+             num_accepted_tokens=num_accepted_tokens,
++            spec_decode_src_indices=spec_decode_src_indices,
++            non_spec_num_accepted_tokens=non_spec_num_accepted_tokens,
+             nums_dict=nums_dict,
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2362,6 +2362,17 @@
+                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
+                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
+                     )
++            elif (
++                not use_spec_decode
++                and self.speculative_config is not None
++                and isinstance(
++                    builder,
++                    (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
++                )
++            ):
++                extra_attn_metadata_args = dict(
++                    num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
++                )
+ 
+             if for_cudagraph_capture:
+                 attn_metadata_i = builder.build_for_cudagraph_capture(
